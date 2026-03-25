@@ -94,7 +94,7 @@ class LiveView:
         self,
         graph:   HospitalGraph,
         tracker: PatientTracker,
-        interval_ms: int = 40,
+        interval_ms: int = 16, # 60 FPS hardware loop
     ) -> None:
         self._graph   = graph
         self._tracker = tracker
@@ -107,6 +107,8 @@ class LiveView:
         # Sim clock (set externally)
         self.sim_time_min: float = 0.0
         self.sim_running:  bool  = True
+        self.playback_speed: float = 1.0
+        self.get_sim_time: Optional[Callable[[], float]] = None
 
         # Build position map
         self._pos: Dict[str, Tuple[float, float]] = {
@@ -261,10 +263,73 @@ class LiveView:
             edgecolors="#ffffff", linewidths=1.2,
         )
 
+        # Text pool for explicitly labelling moving patients
+        self._patient_labels: List[Any] = []
+        for _ in range(150):
+            lbl = ax.text(
+                0, 0, "", color="white", fontsize=8, 
+                fontweight="bold", ha="center", va="center", zorder=11
+            )
+            lbl.set_visible(False)
+            self._patient_labels.append(lbl)
+
         ax.set_title(
             "Hospital Routing — Live View",
             color="#ecf0f1", fontsize=14, pad=8, fontweight="bold",
         )
+
+        # ----- SIDE PANEL TEXT POOL -----
+        self._ax_panel.set_xlim(0, 1)
+        self._ax_panel.set_ylim(0, 1)
+        
+        y = 0.98
+        lh = 0.040
+
+        def create_txt(text, x=0.03, color="#ecf0f1", size=9, bold=False):
+            nonlocal y
+            txt_obj = self._ax_panel.text(
+                x, y, text[:55],
+                transform=self._ax_panel.transAxes,
+                va="top", ha="left",
+                fontsize=size, color=color,
+                fontweight="bold" if bold else "normal",
+            )
+            y -= lh
+            return txt_obj
+
+        create_txt("HOSPITAL DASHBOARD", size=11, color="#9b59b6", bold=True)
+        y -= 0.01
+
+        self._txt_clock = create_txt("⏱  Sim time: 00h 00m  [Speed: 1.0s/m]", color="#3498db")
+        self._txt_active = create_txt("👥 Active patients: 0", color="#ecf0f1")
+        self._txt_discharged = create_txt("👋 Discharged patients: 0", color="#ecf0f1")
+        y -= 0.01
+
+        create_txt("ZONE DENSITY", size=8, color="#9b59b6", bold=True)
+        self._txt_zones = {}
+        for zone in ZONE_BBOX.keys():
+            self._txt_zones[zone] = create_txt(f"🟢 {zone[:10]:10s} ░░░░░░░░░░ 0.00", size=7.5)
+        y -= 0.01
+
+        create_txt("DEPARTMENT STATUS", size=8, color="#9b59b6", bold=True)
+        self._txt_depts = {}
+        for nd in NODE_DEFS:
+            self._txt_depts[nd.name] = create_txt(f"{nd.name[:14]:14s} 0/0  [available]", size=7, color="#2ecc71")
+        y -= 0.01
+
+        create_txt("LIVE EVENT FEED", size=8, color="#9b59b6", bold=True)
+        self._txt_logs = []
+        for _ in range(5):
+            main_txt = create_txt("", size=7.5)
+            y += (lh - 0.005) # nudge subtext closer to its parent
+            sub_txt = create_txt("", x=0.07, size=6.5, color="#7f8c8d")
+            self._txt_logs.append((main_txt, sub_txt))
+            
+        y -= 0.02
+        create_txt("PRIORITY LEGEND", size=8, color="#9b59b6", bold=True)
+        create_txt("🔴 High-Risk Patient (Fastest route)", color="#e74c3c", size=7)
+        create_txt("🟠 Medium-Risk Patient", color="#f39c12", size=7)
+        create_txt("🔵 Low-Risk Patient (Ambient crowd)", color="#3498db", size=7)
 
     # ── animation ─────────────────────────────────────────────────────────────
     def _update_frame(self, frame: int) -> List:
@@ -309,18 +374,38 @@ class LiveView:
             changed.append(txt)
 
         # -- Moving dots --
-        transit = self._tracker.all_in_transit()
+        if self.get_sim_time:
+            self.sim_time_min = self.get_sim_time()
+            
+        transit = self._tracker.all_in_transit(self.sim_time_min)
         xs, ys, colors = [], [], []
-        for t in transit:
+
+        # Hide old labels
+        for lbl in self._patient_labels:
+            if lbl.get_visible():
+                lbl.set_visible(False)
+                changed.append(lbl)
+
+        for i, t in enumerate(transit):
             sx, sy = self._pos.get(t["src"], (0, 0))
             dx, dy = self._pos.get(t["dst"], (0, 0))
             p = t["progress"]
             # Perpendicular offset so dots don't overlap the edge line
             nx_off = -(dy - sy) * 0.07
             ny_off =  (dx - sx) * 0.07
-            xs.append(sx + (dx - sx) * p + nx_off)
-            ys.append(sy + (dy - sy) * p + ny_off)
+            px = sx + (dx - sx) * p + nx_off
+            py = sy + (dy - sy) * p + ny_off
+            xs.append(px)
+            ys.append(py)
             colors.append(_priority_dot_color(t["priority"]))
+
+            # Render overlay label
+            if i < len(self._patient_labels):
+                lbl = self._patient_labels[i]
+                lbl.set_position((px, py))
+                lbl.set_text(t["priority"][0].upper())
+                lbl.set_visible(True)
+                changed.append(lbl)
 
         if xs:
             pts = np.c_[xs, ys]
@@ -334,47 +419,20 @@ class LiveView:
             self._glow_scatter.set_offsets(empty)
         changed.extend([self._dot_scatter, self._glow_scatter])
 
-        # -- Side panel --
-        self._draw_panel()
+        # -- Side panel updates --
+        self._update_panel(changed)
 
         return changed
 
-    def _draw_panel(self) -> None:
-        ax = self._ax_panel
-        ax.cla()
-        ax.set_facecolor("#0f111a")
-        ax.set_xlim(0, 1)
-        ax.set_ylim(0, 1)
-        ax.set_xticks([])
-        ax.set_yticks([])
-        for spine in ax.spines.values():
-            spine.set_visible(False)
-
-        y = 0.97
-        lh = 0.035   # line height
-
-        def txt(text, x=0.03, color="#ecf0f1", size=9, bold=False):
-            nonlocal y
-            ax.text(
-                x, y, text,
-                transform=ax.transAxes,
-                va="top", ha="left",
-                fontsize=size, color=color,
-                fontweight="bold" if bold else "normal",
-            )
-            y -= lh
-
-        txt("HOSPITAL DASHBOARD", size=11, color="#9b59b6", bold=True)
-        y -= 0.01
-
+    def _update_panel(self, changed: List[Any]) -> None:
         # Sim clock
         mins = int(self.sim_time_min)
-        txt(f"⏱  Sim time: {mins // 60:02d}h {mins % 60:02d}m", color="#3498db")
-        txt(f"👥 Active patients: {self._tracker.active_patient_count()}", color="#ecf0f1")
-        y -= 0.01
+        self._txt_clock.set_text(f"Sim time: {mins // 60:02d}h {mins % 60:02d}m  [Speed: {self.playback_speed}s/m]")
+        self._txt_active.set_text(f"Active patients: {self._tracker.active_patient_count()}")
+        self._txt_discharged.set_text(f"Discharged patients: {self._tracker.get_total_discharged()}")
+        changed.extend([self._txt_clock, self._txt_active, self._txt_discharged])
 
         # Zone density
-        txt("ZONE DENSITY", size=8, color="#9b59b6", bold=True)
         zone_densities = self._graph.zoom_level_1()
         zone_colors = {
             "entry": "#7f8c8d", "emergency": "#e74c3c",
@@ -389,14 +447,12 @@ class LiveView:
                 "🟡" if density <= DENSITY_AMBER else
                 "🟠" if density <= DENSITY_ORANGE else "🔴"
             )
-            txt(
-                f"{color_label} {zone[:10]:10s} {bar} {density:.2f}",
-                color=zone_colors.get(zone, "#7f8c8d"), size=7.5
-            )
-        y -= 0.01
+            txt_obj = self._txt_zones[zone]
+            txt_obj.set_text(f"{color_label} {zone[:10]:10s} {bar} {density:.2f}")
+            txt_obj.set_color(zone_colors.get(zone, "#7f8c8d"))
+            changed.append(txt_obj)
 
         # Department status
-        txt("DEPARTMENT STATUS", size=8, color="#9b59b6", bold=True)
         for nd in NODE_DEFS:
             info = self._graph.zoom_level_3(nd.name)
             if nd.beds_total > 0:
@@ -408,45 +464,50 @@ class LiveView:
                 "available": "#2ecc71", "busy": "#f39c12",
                 "near_full": "#e67e22", "full": "#e74c3c",
             }.get(status, "#7f8c8d")
-            txt(
-                f"{nd.name[:14]:14s} {occ_str}  [{status[:8]}]",
-                color=scol, size=7,
-            )
-        y -= 0.01
+            
+            txt_obj = self._txt_depts[nd.name]
+            txt_obj.set_text(f"{nd.name[:14]:14s} {occ_str}  [{status[:8]}]")
+            txt_obj.set_color(scol)
+            changed.append(txt_obj)
 
-        # Last 5 routing decisions as Event Feed
-        txt("LIVE EVENT FEED", size=8, color="#9b59b6", bold=True)
+        # Event Feed
         with self._log_lock:
             log_entries = list(self._route_log)
 
-        for entry in reversed(log_entries[-6:]):
+        # Clear unused logs
+        for main_txt, sub_txt in self._txt_logs:
+            main_txt.set_text("")
+            sub_txt.set_text("")
+            changed.extend([main_txt, sub_txt])
+
+        for i, entry in enumerate(reversed(log_entries[-5:])):
+            if i >= len(self._txt_logs):
+                break
+            main_txt, sub_txt = self._txt_logs[i]
+            
             p = entry['priority'].upper()
             p_color = _priority_dot_color(entry["priority"])
             t_min = int(entry["sim_time"])
             dst = entry['path'][-1].upper() if entry['path'] else 'UNKNOWN'
             reason = entry.get("reasoning", "")
             
-            if entry.get("is_reroute"):
+            if entry.get("is_discharge"):
+                msg = f"[{t_min}m] ✅ {p} patient discharged & left hospital."
+            elif entry.get("is_reroute"):
                 if "Exit Routing" in reason:
-                    msg = f"[{t_min}m] {p} patient successfully discharged."
+                    msg = f"[{t_min}m] {p} patient treated! Walking to exit."
                 else:
                     msg = f"[{t_min}m] ⚠️ REROUTE: {p} patient sent to {dst}."
             else:
                 msg = f"[{t_min}m] New {p} risk patient routed to {dst}."
 
-            txt(msg, color=p_color, size=7.5)
+            main_txt.set_text(msg[:55])
+            main_txt.set_color(p_color)
             
-            if entry.get("is_reroute") and "Exit" not in reason:
+            if entry.get("is_reroute") and "Exit" not in reason and not entry.get("is_discharge"):
                 if "|" in reason:
                     shorthand = reason.split("|")[-1].strip()
-                    txt(f"      ↳ {shorthand[:42]}", color="#7f8c8d", size=6.5)
-            y -= 0.005
-            
-        y -= 0.02
-        txt("PRIORITY LEGEND", size=8, color="#9b59b6", bold=True)
-        txt("🔴 High-Risk Patient (Fastest route)", color="#e74c3c", size=7)
-        txt("🟠 Medium-Risk Patient", color="#f39c12", size=7)
-        txt("🔵 Low-Risk Patient (Ambient crowd)", color="#3498db", size=7)
+                    sub_txt.set_text(f"↳ {shorthand[:42]}")
 
     def _node_label(self, name: str) -> str:
         nd   = NODE_DEF_MAP[name]
@@ -471,7 +532,7 @@ class LiveView:
             self._fig,
             self._update_frame,
             interval=self._interval,
-            blit=False,
+            blit=True,  # ⚡ Hardware acceleration enabled
             cache_frame_data=False,
         )
         plt.show()

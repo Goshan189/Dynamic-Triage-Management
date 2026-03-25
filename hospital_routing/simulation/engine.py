@@ -90,14 +90,15 @@ class SimulationEngine:
         else:
             self._env = simpy.Environment()
             
-        self._env.process(self._arrival_generator(self._env, duration_min))
+        # Disconnected the automated Poisson stream. Patients only spawn via manual terminal injections.
+        # self._env.process(self._arrival_generator(self._env, duration_min))
         self._env.process(self._injection_monitor(self._env))
         self._env.run(until=duration_min)
         return self._metrics
 
-    def inject_patient(self, priority: Optional[str] = None, vitals: Optional[dict] = None) -> None:
+    def inject_patient(self, priority: Optional[str] = None, vitals: Optional[dict] = None, is_manual: bool = False) -> None:
         """Thread-safe external injection of a patient."""
-        self._injection_queue.put((priority, vitals))
+        self._injection_queue.put({"priority": priority, "vitals": vitals, "is_manual": is_manual})
 
     @property
     def metrics(self) -> SimMetrics:
@@ -112,8 +113,13 @@ class SimulationEngine:
         """Polls the thread-safe queue for manual patient injections."""
         while True:
             while not self._injection_queue.empty():
-                p, v = self._injection_queue.get()
-                env.process(self._patient_process(env, priority=p, vitals=v))
+                item = self._injection_queue.get()
+                env.process(self._patient_process(
+                    env, 
+                    priority=item.get("priority"), 
+                    vitals=item.get("vitals"), 
+                    is_manual=item.get("is_manual", False)
+                ))
             yield env.timeout(0.1)  # tiny tick to keep thread responsive
 
     def _arrival_generator(self, env: simpy.Environment, until: float):
@@ -136,7 +142,10 @@ class SimulationEngine:
             vitals = self._bridge.generate_synthetic_vitals(target_risk=target_risk)
             env.process(self._patient_process(env, vitals=vitals))
 
-    def _patient_process(self, env: simpy.Environment, priority: Optional[str] = None, vitals: Optional[dict] = None):
+    def _patient_process(
+        self, env: simpy.Environment, priority: Optional[str] = None, 
+        vitals: Optional[dict] = None, is_manual: bool = False
+    ):
         """Full patient lifecycle."""
         # 1. Generate vitals and classify
         if vitals is None:
@@ -147,14 +156,48 @@ class SimulationEngine:
             priority = result["priority"]   # use ML priority unless forced
 
         # 2. Plan route from entrance
-        route = Router.compute_route("entrance", priority, self._graph)
+        preferred, clinical_reason = self._bridge.get_clinical_allocation(vitals, priority)
+        route = Router.compute_route("entrance", priority, self._graph, preferred_dest=preferred)
         dest  = route.path[-1]
+        
+        # Inject the clinical reasoning directly into the live feed
+        route.reasoning = f"{clinical_reason} | {route.reasoning}"
 
         # 3. Register patient
         pid = f"P{self._patient_counter:05d}"
         self._patient_counter += 1
         arrival_time = env.now
         self._tracker.register(pid, priority, route.path, arrival_time)
+
+        # 4. Terminal Output for explicit Manual efficiency tracing
+        if is_manual:
+            print(f"\n[System] Manually injected patient {pid} into simulation stream.")
+            print(f"======= ⚕️ MANUAL INJECTION TRACE: {pid} =======")
+            print(f"Risk Level:  {result['risk_label'].upper()} (Score: {result['priority_score']:.1%} certainty)")
+            
+            # Print specifically the top 3 vitals that influence the mapping rules
+            cesd = vitals.get('cesd', 0.0)
+            stai = vitals.get('stai_t', 0.0)
+            mbi = vitals.get('mbi_ex', 0.0)
+            print(f"Key Vitals:  CES-D: {cesd:.0f} | STAI-T: {stai:.0f} | MBI: {mbi:.0f}")
+            
+            print(f"Target Node: {dest}")
+            print(f"Clinical Allocation: {clinical_reason}")
+            print("-" * 49)
+            print("Path Efficiency:  Optimal Dijkstra route found!")
+            print(f"Estimated Time:   {route.eta_seconds:.1f} seconds")
+            print(f"Dijkstra Nodes:   {' → '.join(route.path)}")
+            print("Corridor Densities at Time of Execution:")
+            
+            from graph.layout import EDGE_DEF_MAP
+            for i in range(len(route.path) - 1):
+                src = route.path[i]
+                nxt = route.path[i+1]
+                if (src, nxt) in EDGE_DEF_MAP:
+                    dens = self._graph.get_edge_density(src, nxt)
+                    color = self._graph.density_color(dens).upper()
+                    print(f"  - {src} → {nxt} : {dens:.2f} ({color})")
+            print("=" * 49 + "\n")
 
         # Log routing decision
         self._log_route(env.now, pid, priority, route)
@@ -174,7 +217,7 @@ class SimulationEngine:
                 dst = path[current_idx + 1]
 
                 # Depart from current node
-                _, _, travel_s = self._tracker.depart(pid)
+                _, _, travel_s = self._tracker.depart(pid, env.now)
                 travel_min = travel_s / 60.0
 
                 # Update peak edge density
@@ -196,7 +239,7 @@ class SimulationEngine:
                     # Corridor is congested, reroute around it
                     new_route = Router.compute_route(
                         arrived_at, priority, self._graph,
-                        preferred_dest=path[-1]
+                        preferred_dest=[path[-1]]
                     )
                     self._tracker.reroute(pid, new_route.path)
                     state = self._tracker.get_state(pid)
@@ -251,6 +294,7 @@ class SimulationEngine:
         # Phase 5: Discharge from the system
         try:
             self._tracker.discharge(pid)
+            self._log_route(env.now, pid, priority, None, is_discharge=True)
         except Exception:
             pass
             
@@ -265,15 +309,17 @@ class SimulationEngine:
         priority:   str,
         route:      Any,
         is_reroute: bool = False,
+        is_discharge: bool = False,
     ) -> None:
         entry = {
             "sim_time":   sim_time,
             "patient_id": pid,
             "priority":   priority,
-            "path":       route.path,
-            "eta_s":      route.eta_seconds,
-            "reasoning":  route.reasoning,
+            "path":       route.path if route else [],
+            "eta_s":      route.eta_seconds if route else 0.0,
+            "reasoning":  route.reasoning if route else "Discharged gracefully",
             "is_reroute": is_reroute,
+            "is_discharge": is_discharge,
         }
         self._metrics.routing_log.append(entry)
         if self._on_routing_event:

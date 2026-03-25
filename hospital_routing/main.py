@@ -33,8 +33,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--duration",  type=float, default=480.0,
                    help="Simulation duration in minutes (default: 480)")
-    p.add_argument("--speed",     type=float, default=0.6,
-                   help="Real-time seconds per simulation minute (default: 0.6)")
+    p.add_argument("--speed",     type=float, default=1.2,
+                   help="Real-time seconds per simulation minute (default: 1.2)")
     p.add_argument("--data-path", type=str, default=None,
                    help="Path to data.csv (auto-detected if omitted)")
     return p
@@ -97,7 +97,7 @@ def main() -> None:
             print(" INTERACTIVE MODE ENABLED")
             print(" Commands:")
             print("  spawn         -> Random synthetic patient")
-            print("  spawn high    -> Force High-Risk patient")
+            print("  spawn <level> -> Force High/Medium/Low-Risk ('spawn high')")
             print("  spawn row <N> -> Inject patient from data.csv row N")
             print("  surge <N>     -> Queue N random patients instantly")
             print("  ambient <0-1> -> Fills hospital with low-priority non-emergency patients")
@@ -108,15 +108,19 @@ def main() -> None:
                     if not cmd:
                         continue
                     if cmd == "spawn":
-                        engine.inject_patient()
+                        engine.inject_patient(is_manual=True)
                     elif cmd == "spawn high":
-                        engine.inject_patient(priority="high")
+                        engine.inject_patient(priority="high", is_manual=True)
+                    elif cmd == "spawn medium":
+                        engine.inject_patient(priority="medium", is_manual=True)
+                    elif cmd == "spawn low":
+                        engine.inject_patient(priority="low", is_manual=True)
                     elif cmd.startswith("spawn row "):
                         try:
                             row_idx = int(cmd.split()[-1])
                             bridge = engine._bridge
                             v = bridge.get_patient_row(row_idx)
-                            engine.inject_patient(vitals=v)
+                            engine.inject_patient(vitals=v, is_manual=True)
                         except ValueError:
                             print("Invalid row number.")
                     elif cmd.startswith("surge "):
@@ -164,6 +168,7 @@ def main() -> None:
         from visualisation.live_view import LiveView
 
         view = LiveView(graph, tracker, interval_ms=40)
+        view.playback_speed = args.speed
 
         # Hook the routing event callback so the side panel stays updated
         engine_on_event = engine._on_routing_event
