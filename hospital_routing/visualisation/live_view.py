@@ -253,12 +253,12 @@ class LiveView:
 
         # Dot scatter for in-transit patients (empty initially)
         self._glow_scatter = ax.scatter(
-            [], [], c=[], s=250, zorder=9,
-            edgecolors="none", alpha=0.3,
+            [], [], c=[], s=450, zorder=9,
+            edgecolors="none", alpha=0.35,
         )
         self._dot_scatter = ax.scatter(
-            [], [], c=[], s=60, zorder=10,
-            edgecolors="#ecf0f1", linewidths=0.5,
+            [], [], c=[], s=160, zorder=10,
+            edgecolors="#ffffff", linewidths=1.2,
         )
 
         ax.set_title(
@@ -291,7 +291,16 @@ class LiveView:
             ratio = (info["beds_occupied"] / nd.beds_total) if nd.beds_total > 0 else 0.0
             fc    = _node_face_color(ratio)
             patch = self._node_patches[nd.name]
+            
             patch.set_facecolor(fc)
+            
+            if info["status"] == "full":
+                patch.set_edgecolor("#ff0000")
+                patch.set_linewidth(3 + 3 * np.abs(np.sin(frame * 0.15)))
+            else:
+                patch.set_edgecolor("#ecf0f1")
+                patch.set_linewidth(2)
+                
             changed.append(patch)
 
             # Label
@@ -405,26 +414,39 @@ class LiveView:
             )
         y -= 0.01
 
-        # Last 5 routing decisions
-        txt("RECENT ROUTING", size=8, color="#9b59b6", bold=True)
+        # Last 5 routing decisions as Event Feed
+        txt("LIVE EVENT FEED", size=8, color="#9b59b6", bold=True)
         with self._log_lock:
             log_entries = list(self._route_log)
 
-        for entry in reversed(log_entries[-5:]):
-            path_str = "→".join(entry["path"])
-            rr = "↻" if entry.get("is_reroute") else "→"
+        for entry in reversed(log_entries[-6:]):
+            p = entry['priority'].upper()
             p_color = _priority_dot_color(entry["priority"])
             t_min = int(entry["sim_time"])
-            txt(
-                f"{rr}[{entry['priority'][0].upper()}] t={t_min:3d} "
-                f"{path_str[:22]}",
-                color=p_color, size=6.5,
-            )
-            # Reasoning (truncated)
+            dst = entry['path'][-1].upper() if entry['path'] else 'UNKNOWN'
             reason = entry.get("reasoning", "")
-            if "|" in reason:
-                reason = reason.split("|")[-1].strip()
-            txt(f"   {reason[:38]}", color="#7f8c8d", size=6)
+            
+            if entry.get("is_reroute"):
+                if "Exit Routing" in reason:
+                    msg = f"[{t_min}m] {p} patient successfully discharged."
+                else:
+                    msg = f"[{t_min}m] ⚠️ REROUTE: {p} patient sent to {dst}."
+            else:
+                msg = f"[{t_min}m] New {p} risk patient routed to {dst}."
+
+            txt(msg, color=p_color, size=7.5)
+            
+            if entry.get("is_reroute") and "Exit" not in reason:
+                if "|" in reason:
+                    shorthand = reason.split("|")[-1].strip()
+                    txt(f"      ↳ {shorthand[:42]}", color="#7f8c8d", size=6.5)
+            y -= 0.005
+            
+        y -= 0.02
+        txt("PRIORITY LEGEND", size=8, color="#9b59b6", bold=True)
+        txt("🔴 High-Risk Patient (Fastest route)", color="#e74c3c", size=7)
+        txt("🟠 Medium-Risk Patient", color="#f39c12", size=7)
+        txt("🔵 Low-Risk Patient (Ambient crowd)", color="#3498db", size=7)
 
     def _node_label(self, name: str) -> str:
         nd   = NODE_DEF_MAP[name]

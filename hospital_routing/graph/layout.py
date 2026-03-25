@@ -38,6 +38,13 @@ SPILLOVER_FACTOR = 0.35
 # Walking speed (m/s) — used for base_time_s = distance / speed
 WALK_SPEED = 1.2  # m/s
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Visual Pacing
+# Because the simulation scales time linearly, a 20-second walk completes in 
+# <0.05 real seconds, making patients visually teleport. We significantly
+# inflate travel times so patients have a visible tracking trajectory.
+# ──────────────────────────────────────────────────────────────────────────────
+VISUAL_PACE_MULTIPLIER = 12.0
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Zone definitions
@@ -103,10 +110,12 @@ class EdgeDef:
 
 
 def _edge(src: str, dst: str, dist_m: float, cap: int) -> EdgeDef:
-    return EdgeDef(src, dst, dist_m, round(dist_m / WALK_SPEED, 1), cap)
+    raw_s = dist_m / WALK_SPEED
+    paced_s = raw_s * VISUAL_PACE_MULTIPLIER
+    return EdgeDef(src, dst, dist_m, round(paced_s, 1), cap)
 
 
-EDGE_DEFS: List[EdgeDef] = [
+_BASE_EDGES: List[EdgeDef] = [
     _edge("entrance",      "triage",         20, 12),
     _edge("triage",        "emergency",       35,  8),
     _edge("triage",        "radiology",       40,  8),
@@ -126,6 +135,11 @@ EDGE_DEFS: List[EdgeDef] = [
     _edge("ward_surgical", "ward_general",    55,  6),
 ]
 
+EDGE_DEFS: List[EdgeDef] = []
+for ed in _BASE_EDGES:
+    EDGE_DEFS.append(ed)
+    EDGE_DEFS.append(EdgeDef(ed.dst, ed.src, ed.distance_m, ed.base_time_s, ed.corridor_capacity))
+
 # Quick lookup: (src, dst) → EdgeDef
 EDGE_DEF_MAP: Dict[Tuple[str, str], EdgeDef] = {
     (e.src, e.dst): e for e in EDGE_DEFS
@@ -143,7 +157,7 @@ PRIORITY_DESTINATIONS: Dict[str, List[str]] = {
 
 # Service times in minutes per destination type
 SERVICE_TIMES_MIN: Dict[str, float] = {
-    "emergency":     45.0,
+    "emergency":    180.0,
     "icu":          120.0,
     "ward_surgical": 90.0,
     "ward_general":  90.0,

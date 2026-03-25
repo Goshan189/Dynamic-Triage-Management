@@ -16,6 +16,7 @@ Imports: graph/ and ml/ only (no visualisation/).
 
 from __future__ import annotations
 
+import queue
 import random
 import time
 from collections import defaultdict
@@ -79,18 +80,24 @@ class SimulationEngine:
         self._patient_counter = 0
         self._on_routing_event = on_routing_event   # hook for live_view
         self._env: Optional[simpy.Environment] = None
+        self._injection_queue = queue.Queue()
 
     # ── public ────────────────────────────────────────────────────────────────
     def run(self, duration_min: float = SIM_DURATION_MIN, rt_factor: Optional[float] = None) -> SimMetrics:
         if rt_factor is not None and rt_factor > 0:
-            import simpy.rt
-            self._env = simpy.rt.RealtimeEnvironment(factor=rt_factor, strict=False)
+            from simpy.rt import RealtimeEnvironment
+            self._env = RealtimeEnvironment(factor=rt_factor, strict=False)
         else:
             self._env = simpy.Environment()
             
         self._env.process(self._arrival_generator(self._env, duration_min))
+        self._env.process(self._injection_monitor(self._env))
         self._env.run(until=duration_min)
         return self._metrics
+
+    def inject_patient(self, priority: Optional[str] = None, vitals: Optional[dict] = None) -> None:
+        """Thread-safe external injection of a patient."""
+        self._injection_queue.put((priority, vitals))
 
     @property
     def metrics(self) -> SimMetrics:
@@ -101,23 +108,43 @@ class SimulationEngine:
         return self._env
 
     # ── SimPy generators ──────────────────────────────────────────────────────
+    def _injection_monitor(self, env: simpy.Environment):
+        """Polls the thread-safe queue for manual patient injections."""
+        while True:
+            while not self._injection_queue.empty():
+                p, v = self._injection_queue.get()
+                env.process(self._patient_process(env, priority=p, vitals=v))
+            yield env.timeout(0.1)  # tiny tick to keep thread responsive
+
     def _arrival_generator(self, env: simpy.Environment, until: float):
-        """Poisson arrival stream."""
+        """Poisson arrival stream with real-world priority distribution."""
         while True:
             inter = self._rng.expovariate(1.0 / ARRIVAL_MEAN_MIN)
             yield env.timeout(inter)
             if env.now >= until:
                 break
-            # Spawn a patient process
-            priority = self._rng.choices(PRIORITIES, weights=PRIORITY_WTS_LIST)[0]
-            env.process(self._patient_process(env, priority))
+                
+            # Enforce real-world distribution: 60% Low, 30% Medium, 10% High
+            p = self._rng.random()
+            if p < 0.60:
+                target_risk = "Low Risk"
+            elif p < 0.90:
+                target_risk = "Medium Risk"
+            else:
+                target_risk = "High Risk"
+                
+            vitals = self._bridge.generate_synthetic_vitals(target_risk=target_risk)
+            env.process(self._patient_process(env, vitals=vitals))
 
-    def _patient_process(self, env: simpy.Environment, priority: str):
+    def _patient_process(self, env: simpy.Environment, priority: Optional[str] = None, vitals: Optional[dict] = None):
         """Full patient lifecycle."""
         # 1. Generate vitals and classify
-        vitals   = self._bridge.generate_synthetic_vitals()
-        result   = self._bridge.classify(vitals)
-        priority = result["priority"]   # override with ML result
+        if vitals is None:
+            vitals = self._bridge.generate_synthetic_vitals()
+        result = self._bridge.classify(vitals)
+        
+        if priority is None:
+            priority = result["priority"]   # use ML priority unless forced
 
         # 2. Plan route from entrance
         route = Router.compute_route("entrance", priority, self._graph)
@@ -135,67 +162,99 @@ class SimulationEngine:
         # Snapshot bed timeline for entrance
         self._snapshot_bed_timeline(env.now, route.path[0])
 
-        # 4. Walk corridor by corridor
-        path = list(route.path)
-        current_idx = 0
-
-        while current_idx < len(path) - 1:
-            src = path[current_idx]
-            dst = path[current_idx + 1]
-
-            # Depart from current node
-            _, _, travel_s = self._tracker.depart(pid)
-            travel_min = travel_s / 60.0
-
-            # Update peak edge density
-            self._update_peak_density(src, dst)
-
-            # Simulate travel time
-            yield env.timeout(travel_min)
-
-            # Arrive at next node
-            arrived_at = self._tracker.arrive(pid)
-            self._snapshot_bed_timeline(env.now, arrived_at)
-
-            # Check if reroute needed
+        # Helper generator for walking the current active path
+        def walk_current_path():
             state = self._tracker.get_state(pid)
-            if state is None:
-                return
+            if not state: return
+            path = state["path"]
+            current_idx = state["path_index"]
 
-            remaining = path[current_idx + 1:]
-            if Router.needs_reroute(arrived_at, remaining, priority, self._graph):
-                new_route = Router.compute_route(
-                    arrived_at, priority, self._graph,
-                    preferred_dest=path[-1]
-                )
-                self._tracker.reroute(pid, new_route.path)
-                path = self._tracker.get_state(pid)["path"]
-                current_idx = self._tracker.get_state(pid)["path_index"]
-                self._metrics.total_reroutes += 1
-                self._log_route(env.now, pid, priority, new_route, is_reroute=True)
-            else:
-                current_idx += 1
-                # Refresh path in case it was updated
+            while current_idx < len(path) - 1:
+                src = path[current_idx]
+                dst = path[current_idx + 1]
+
+                # Depart from current node
+                _, _, travel_s = self._tracker.depart(pid)
+                travel_min = travel_s / 60.0
+
+                # Update peak edge density
+                self._update_peak_density(src, dst)
+
+                # Simulate travel time
+                yield env.timeout(travel_min)
+
+                # Arrive at next node (which might clear corridor edge and populate node)
+                arrived_at = self._tracker.arrive(pid)
+                self._snapshot_bed_timeline(env.now, arrived_at)
+
+                # Fetch updated state incase something changed
                 state = self._tracker.get_state(pid)
-                if state:
-                    path = state["path"]
+                if state is None: return
 
-        # 5. Service time at final destination
-        final_node = path[-1]
+                remaining = path[current_idx + 1:]
+                if remaining and Router.needs_reroute(arrived_at, remaining, priority, self._graph):
+                    # Corridor is congested, reroute around it
+                    new_route = Router.compute_route(
+                        arrived_at, priority, self._graph,
+                        preferred_dest=path[-1]
+                    )
+                    self._tracker.reroute(pid, new_route.path)
+                    state = self._tracker.get_state(pid)
+                    path = state["path"]
+                    current_idx = state["path_index"]
+                    self._metrics.total_reroutes += 1
+                    self._log_route(env.now, pid, priority, new_route, is_reroute=True)
+                else:
+                    current_idx += 1
+                    state = self._tracker.get_state(pid)
+                    if state:
+                        path = state["path"]
+
+        # Phase 1: Walk to department
+        yield from walk_current_path()
+
+        # Phase 2: Triage waiting loop (if hospital is completely full)
+        state = self._tracker.get_state(pid)
+        if not state: return
+        final_node = state["current_node"]
+        
+        while final_node == "triage":
+            # Wait 5 minutes before checking for an open bed again
+            yield env.timeout(5.0)
+            new_route = Router.compute_route("triage", priority, self._graph)
+            if new_route.path[-1] != "triage":
+                # Found a free destination!
+                self._tracker.reroute(pid, new_route.path)
+                self._log_route(env.now, pid, priority, new_route, is_reroute=True)
+                yield from walk_current_path()
+                
+                state = self._tracker.get_state(pid)
+                if not state: return
+                final_node = state["current_node"]
+
+        if final_node is None: return
+
+        # Phase 3: Service time at destination
         service_min = SERVICE_TIMES_MIN.get(final_node, 30.0)
         service_min = self._rng.expovariate(1.0 / service_min)
         wait_start = env.now
         yield env.timeout(service_min)
-
-        # Record wait time (service time in this simplified model = total wait)
         self._metrics.wait_times[priority].append(service_min)
 
-        # 6. Discharge
+        # Phase 4: Walk to Exit (Entrance)
+        if final_node != "entrance":
+            exit_route = Router.compute_exit_route(final_node, priority, self._graph, dest="entrance")
+            self._tracker.reroute(pid, exit_route.path)
+            self._log_route(env.now, pid, "low", exit_route, is_reroute=True)
+            yield from walk_current_path()
+            
+        # Phase 5: Discharge from the system
         try:
             self._tracker.discharge(pid)
         except Exception:
             pass
-        self._snapshot_bed_timeline(env.now, final_node)
+            
+        self._snapshot_bed_timeline(env.now, "entrance")
         self._metrics.patients_processed += 1
 
     # ── helpers ───────────────────────────────────────────────────────────────

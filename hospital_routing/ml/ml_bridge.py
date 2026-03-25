@@ -63,11 +63,37 @@ class MLBridge:
         }
 
     # ── synthetic vitals ──────────────────────────────────────────────────────
-    def generate_synthetic_vitals(self) -> dict:
+    def generate_synthetic_vitals(self, target_risk: str | None = None) -> dict:
         """
-        Sample a synthetic patient vitals row from the training distribution.
-        Uses mean ± std per column (Gaussian), clipped to observed range where
-        appropriate (no negative values for count-like columns).
+        Sample a realistic patient vitals row directly from the training dataset.
+        If target_risk is specified (e.g. 'Low Risk'), we sample only from rows
+        with that label, guaranteeing our desired statistical distributions.
+        """
+        df = self._model._df
+        if df.empty:
+            # Fallback if model isn't trained
+            return self._fallback_synthetic_vitals()
+            
+        if target_risk:
+            subset = df[df["risk_label"] == target_risk]
+            if not subset.empty:
+                idx = self._rng.integers(0, len(subset))
+                row = subset.iloc[idx]
+            else:
+                idx = self._rng.integers(0, len(df))
+                row = df.iloc[idx]
+        else:
+            idx = self._rng.integers(0, len(df))
+            row = df.iloc[idx]
+            
+        vitals = {}
+        for col in self._model.feature_cols:
+            vitals[col] = float(row[col])
+        return vitals
+
+    def _fallback_synthetic_vitals(self) -> dict:
+        """
+        Old Gaussian estimation method.
         """
         vitals = {}
         for col, stats in self._col_stats.items():
@@ -80,6 +106,18 @@ class MLBridge:
                        "amsp", "year"):
                 val = max(0.0, val)
             vitals[col] = val
+        return vitals
+
+    def get_patient_row(self, row_index: int) -> dict:
+        """Fetch a specific row from data.csv for injection."""
+        df = self._model._df
+        if df.empty or row_index < 0 or row_index >= len(df):
+            return self.generate_synthetic_vitals()
+        
+        row = df.iloc[row_index]
+        vitals = {}
+        for col in self._model.feature_cols:
+            vitals[col] = float(row[col])
         return vitals
 
     # ── model info ────────────────────────────────────────────────────────────

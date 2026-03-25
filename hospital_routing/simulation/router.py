@@ -32,6 +32,7 @@ from graph.layout import (
     AVOIDANCE_THRESHOLD,
     DENSITY_RED,
     EDGE_DEF_MAP,
+    NODE_DEF_MAP,
     PRIORITY_DESTINATIONS,
     WEIGHT_PENALTY,
 )
@@ -67,13 +68,26 @@ class Router:
         """
         valid_dests = PRIORITY_DESTINATIONS[priority]
 
+        # Filter out full destinations
+        available_dests = []
+        for d in valid_dests:
+            nd = NODE_DEF_MAP[d]
+            ns = graph.node_states[d]
+            # beds_total == 0 means it's a queue without a hard limit
+            if nd.beds_total == 0 or ns.beds_occupied < nd.beds_total:
+                available_dests.append(d)
+
+        if not available_dests:
+            # Fallback to triage waiting room
+            available_dests = ["triage"]
+
         # Build list of destinations to try
-        if preferred_dest and preferred_dest in valid_dests:
+        if preferred_dest and preferred_dest in available_dests:
             dests_to_try = [preferred_dest] + [
-                d for d in valid_dests if d != preferred_dest
+                d for d in available_dests if d != preferred_dest
             ]
         else:
-            dests_to_try = list(valid_dests)
+            dests_to_try = list(available_dests)
 
         best: Optional[RouteResult] = None
 
@@ -121,6 +135,21 @@ class Router:
             if density > threshold:
                 return True
         return False
+
+    # ── exit route ────────────────────────────────────────────────────────────
+    @classmethod
+    def compute_exit_route(
+        cls, src: str, priority: str, graph: HospitalGraph, dest: str = "entrance"
+    ) -> RouteResult:
+        """
+        Compute an exit route back to the entrance. Uses low priority routing
+        to avoid cutting off critical inbound patients.
+        """
+        result = cls._dijkstra(src, dest, "low", graph)
+        if result is None:
+            return RouteResult([src, dest], 0.0, "Forced generic exit route")
+        result.reasoning = f"Exit Routing | {result.reasoning}"
+        return result
 
     # ── Dijkstra implementation ───────────────────────────────────────────────
     @classmethod
