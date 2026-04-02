@@ -48,8 +48,8 @@ class Patient:
     current_node:   Optional[str] = None
     transit_src:    Optional[str] = None
     transit_dst:    Optional[str] = None
-    transit_start:  float = 0.0         # real time (seconds) transit began
-    transit_duration: float = 0.0       # base_time_s for this segment
+    transit_start:  float = 0.0         # sim time (minutes) transit began
+    transit_duration: float = 0.0       # sim time (minutes) required for segment
     arrival_time:   float = 0.0         # sim time (minutes) of first registration
     registration_time: float = 0.0      # real wall time of registration
 
@@ -64,6 +64,7 @@ class PatientTracker:
         self._graph   = graph
         self._lock    = threading.Lock()
         self._patients: Dict[str, Patient] = {}
+        self._discharged_count: int = 0
 
     # ── registration ──────────────────────────────────────────────────────────
     def register(
@@ -100,7 +101,7 @@ class PatientTracker:
             self._graph.increment_node_queue(start_node)
 
     # ── movement ──────────────────────────────────────────────────────────────
-    def depart(self, patient_id: str) -> Tuple[str, str, float]:
+    def depart(self, patient_id: str, sim_time: float) -> Tuple[str, str, float]:
         """
         Move patient from current node onto the next corridor segment.
         Returns (src, dst, base_time_s).
@@ -129,8 +130,8 @@ class PatientTracker:
             p.current_node     = None
             p.transit_src      = src
             p.transit_dst      = dst
-            p.transit_start    = time.monotonic()
-            p.transit_duration = transit_duration
+            p.transit_start    = sim_time
+            p.transit_duration = transit_duration / 60.0 # stored in minutes for pure sim-time sync
 
         # Release from source node
         nd = NODE_DEF_MAP[src]
@@ -217,10 +218,12 @@ class PatientTracker:
                 node = p.current_node
                 p.status       = PatientStatus.DISCHARGED
                 p.current_node = None
+                self._discharged_count += 1
             elif p.status == PatientStatus.IN_TRANSIT:
                 # Emergency discharge mid-transit — clear edge
                 src, dst = p.transit_src, p.transit_dst
                 p.status = PatientStatus.DISCHARGED
+                self._discharged_count += 1
             else:
                 del self._patients[patient_id]
                 return
@@ -253,15 +256,18 @@ class PatientTracker:
                 "transit_duration": p.transit_duration,
             }
 
-    def all_in_transit(self) -> List[Dict]:
+    def all_in_transit(self, current_sim_time: float) -> List[Dict]:
         """Return list of patients currently IN_TRANSIT (for visualisation)."""
-        now = time.monotonic()
         with self._lock:
             result = []
             for p in self._patients.values():
                 if p.status == PatientStatus.IN_TRANSIT:
-                    elapsed  = now - p.transit_start
+                    elapsed  = current_sim_time - p.transit_start
                     progress = min(1.0, elapsed / p.transit_duration) if p.transit_duration > 0 else 0.0
+                    
+                    # Sometimes sim_time hasn't advanced a frame yet, prevent negative progress 
+                    progress = max(0.0, progress)
+                    
                     result.append({
                         "patient_id": p.patient_id,
                         "priority":   p.priority,
@@ -281,3 +287,7 @@ class PatientTracker:
     def all_ids(self) -> List[str]:
         with self._lock:
             return list(self._patients.keys())
+
+    def get_total_discharged(self) -> int:
+        with self._lock:
+            return self._discharged_count

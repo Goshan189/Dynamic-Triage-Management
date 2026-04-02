@@ -116,23 +116,29 @@ def _edge(src: str, dst: str, dist_m: float, cap: int) -> EdgeDef:
 
 
 _BASE_EDGES: List[EdgeDef] = [
-    _edge("entrance",      "triage",         20, 12),
-    _edge("triage",        "emergency",       35,  8),
-    _edge("triage",        "radiology",       40,  8),
-    _edge("triage",        "opd_a",           60, 10),
-    _edge("triage",        "opd_b",           55, 10),
-    _edge("emergency",     "icu",             30,  6),
-    _edge("emergency",     "radiology",       50,  8),
-    _edge("emergency",     "lab",             45,  8),
-    _edge("radiology",     "lab",             28,  8),
-    _edge("lab",           "icu",             40,  6),
-    _edge("lab",           "pharmacy",        32,  8),
-    _edge("lab",           "opd_b",           38,  8),
-    _edge("pharmacy",      "opd_b",           22,  8),
-    _edge("pharmacy",      "opd_a",           35,  8),
-    _edge("opd_a",         "ward_surgical",   45,  8),
-    _edge("opd_b",         "ward_general",    45,  8),
-    _edge("ward_surgical", "ward_general",    55,  6),
+    # ---- Acute Fast-Track Pipeline (Game Theory Minimized Distances) ----
+    _edge("entrance",      "triage",         10, 15), # 10m (Fast check-in)
+    _edge("triage",        "emergency",       8, 12), # 8m  (Emergency adjacent to triage)
+    _edge("emergency",     "icu",            12,  8), # 12m (ICU directly behind emergency)
+    _edge("emergency",     "ward_surgical",  15,  8), # 15m (Direct express corridor to surgery)
+    
+    # ---- Diagnostics / Medium Risk (Standard Distances) ----
+    _edge("triage",        "radiology",      40,  8),
+    _edge("emergency",     "radiology",      25,  8),
+    _edge("emergency",     "lab",            35,  8),
+    _edge("radiology",     "lab",            28,  8),
+    _edge("lab",           "icu",            40,  6),
+    _edge("lab",           "pharmacy",       32,  8),
+
+    # ---- Outpatient / Low Risk (De-prioritized further away) ----
+    _edge("triage",        "opd_a",          65, 12),
+    _edge("triage",        "opd_b",          70, 12),
+    _edge("lab",           "opd_b",          38,  8),
+    _edge("pharmacy",      "opd_b",          22,  8),
+    _edge("pharmacy",      "opd_a",          35,  8),
+    _edge("opd_a",         "ward_surgical",  45,  8),
+    _edge("opd_b",         "ward_general",   45,  8),
+    _edge("ward_surgical", "ward_general",   55,  6),
 ]
 
 EDGE_DEFS: List[EdgeDef] = []
@@ -150,22 +156,22 @@ EDGE_DEF_MAP: Dict[Tuple[str, str], EdgeDef] = {
 # Priority → valid destination nodes
 # ──────────────────────────────────────────────────────────────────────────────
 PRIORITY_DESTINATIONS: Dict[str, List[str]] = {
-    "high":   ["emergency", "icu"],
-    "medium": ["emergency", "radiology", "lab", "opd_a", "opd_b"],
-    "low":    ["opd_a", "opd_b", "pharmacy", "ward_surgical", "ward_general"],
+    "high":   ["emergency", "icu", "ward_surgical"],
+    "medium": ["emergency", "radiology", "lab", "ward_general", "ward_surgical"],
+    "low":    ["opd_a", "opd_b", "pharmacy", "radiology", "lab"],
 }
 
-# Service times in minutes per destination type
+# Service times in minutes per destination type (Reduced to speed up simulation departures)
 SERVICE_TIMES_MIN: Dict[str, float] = {
-    "emergency":    180.0,
-    "icu":          120.0,
-    "ward_surgical": 90.0,
-    "ward_general":  90.0,
-    "opd_a":         30.0,
-    "opd_b":         30.0,
-    "radiology":     20.0,
-    "lab":           15.0,
-    "pharmacy":      10.0,
+    "emergency":     25.0,
+    "icu":           45.0,
+    "ward_surgical": 35.0,
+    "ward_general":  30.0,
+    "opd_a":         20.0,
+    "opd_b":         20.0,
+    "radiology":     15.0,
+    "lab":           10.0,
+    "pharmacy":       5.0,
 }
 
 # ──────────────────────────────────────────────────────────────────────────────

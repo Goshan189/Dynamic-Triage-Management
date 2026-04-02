@@ -19,6 +19,10 @@ Public API:
 
 from __future__ import annotations
 
+import logging
+import random
+from typing import Dict, Optional, List
+
 import numpy as np
 
 from ml.ml_triage_model import TriageModel
@@ -61,6 +65,76 @@ class MLBridge:
             "priority_score": priority_score,
             "risk_label":     risk_label,
         }
+
+    def get_clinical_allocation(self, vitals: dict, priority: str) -> tuple[List[str], str]:
+        """
+        Maps a patient's exact psychological scores to a logical hospital department,
+        and provides the medical reasoning string.
+        """
+        from graph.layout import PRIORITY_DESTINATIONS
+        import random
+        
+        valid_dests = PRIORITY_DESTINATIONS[priority]
+        reason = ""
+        preferred = random.choice(valid_dests) # fallback
+
+        cesd = vitals.get("cesd", 0.0)
+        stai = vitals.get("stai_t", 0.0)
+        mbi  = vitals.get("mbi_ex", 0.0)
+        health = vitals.get("health", 5.0)
+
+        if priority == "high":
+            # Wards get first grab at high-anxiety patients
+            if stai > 50:
+                preferred = ["ward_surgical", "icu"]
+                reason = f"Severe anxiety (STAI {stai:.0f}). Routing to quiet Surgical Ward or ICU for isolated monitoring."
+            elif cesd > 45:
+                preferred = ["icu"]
+                reason = f"Critical depression (CES-D {cesd:.0f}). Requires ICU psychiatric stabilization."
+            elif mbi > 40:
+                preferred = ["emergency", "icu"]
+                reason = f"Severe exhaustion (MBI {mbi:.0f}). Routing to Emergency/ICU for acute burnout intervention."
+            else:
+                preferred = ["emergency", "icu", "ward_surgical"]
+                reason = "High aggregate risk score. Fast-tracking to broad acute care."
+
+        elif priority == "medium":
+            # Wards get first grab at medium depression/burnout
+            if cesd > 25:
+                preferred = ["ward_general", "ward_surgical"]
+                reason = f"Clinical depression (CES-D {cesd:.0f}). Routing to General/Surgical Ward for observation."
+            elif mbi > 30:
+                preferred = ["ward_surgical", "ward_general"]
+                reason = f"Moderate exhaustion (MBI {mbi:.0f}). Routing to Wards for inpatient rest."
+            elif stai > 45:
+                preferred = ["lab", "radiology"]
+                reason = f"Elevated anxiety (STAI {stai:.0f}). Routing to Diagnostic Wing for stress biomarker/screening panel."
+            elif health < 3:
+                preferred = ["radiology", "lab"]
+                reason = f"Poor systemic health (Self-Score {health:.0f}). Routing to Diagnostics for physical screening."
+            else:
+                preferred = ["emergency", "ward_general"]
+                reason = "Medium aggregate burnout risk. Routing to Emergency triage or General Ward."
+                
+        else: # low
+            if mbi > 20:
+                preferred = ["pharmacy"]
+                reason = f"Mild exhaustion (MBI {mbi:.0f}). Routing to Pharmacy for outpatient supplements."
+            elif stai > 35:
+                preferred = ["opd_a", "opd_b"]
+                reason = f"Mild anxiety (STAI {stai:.0f}). Routing to standard OPD clinics for routine counseling."
+            else:
+                preferred = ["opd_b", "opd_a", "pharmacy"]
+                reason = "Standard baseline vitals. Routing to Outpatient clinics for general checkup."
+
+        # Ensure preferred targets are physically accessible for this node priority
+        valid_preferred = [p for p in preferred if p in valid_dests]
+        if not valid_preferred:
+            # Fallback to absolute load balancing across every valid destination assigned to this priority
+            valid_preferred = valid_dests
+            reason = f"{reason} (Fallback: Matrix Load Balancing constraint)"
+
+        return valid_preferred, reason
 
     # ── synthetic vitals ──────────────────────────────────────────────────────
     def generate_synthetic_vitals(self, target_risk: str | None = None) -> dict:

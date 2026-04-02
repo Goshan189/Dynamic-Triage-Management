@@ -57,14 +57,14 @@ class Router:
         src:      str,
         priority: str,
         graph:    HospitalGraph,
-        preferred_dest: Optional[str] = None,
+        preferred_dest: Optional[List[str]] = None,
     ) -> RouteResult:
         """
         Compute the optimal route from src to any valid destination for this
-        priority level.
+        priority level using Game Theory matrix logic.
 
-        Returns the best RouteResult among all possible destinations.
-        If preferred_dest is given, try it first; fall back to all valid dests.
+        Evaluates ALL clinically acceptable target targets (`preferred_dest`) 
+        and calculates the optimal Nash Equilibrium route balancing Path ETA and Node Queues.
         """
         valid_dests = PRIORITY_DESTINATIONS[priority]
 
@@ -73,7 +73,6 @@ class Router:
         for d in valid_dests:
             nd = NODE_DEF_MAP[d]
             ns = graph.node_states[d]
-            # beds_total == 0 means it's a queue without a hard limit
             if nd.beds_total == 0 or ns.beds_occupied < nd.beds_total:
                 available_dests.append(d)
 
@@ -81,15 +80,17 @@ class Router:
             # Fallback to triage waiting room
             available_dests = ["triage"]
 
-        # Build list of destinations to try
-        if preferred_dest and preferred_dest in available_dests:
-            dests_to_try = [preferred_dest] + [
-                d for d in available_dests if d != preferred_dest
-            ]
-        else:
+        # If clinical targets are provided, intersect them with available (unblocked) targets
+        dests_to_try = []
+        if preferred_dest:
+            dests_to_try = [d for d in preferred_dest if d in available_dests]
+            
+        # Fallback to any valid dests if the preferred targets are perfectly deadlocked/full
+        if not dests_to_try:
             dests_to_try = list(available_dests)
 
         best: Optional[RouteResult] = None
+        best_cost: float = float('inf')
 
         for dest in dests_to_try:
             if dest == src:
@@ -97,12 +98,19 @@ class Router:
             result = cls._dijkstra(src, dest, priority, graph)
             if result is None:
                 continue
-            if best is None or result.eta_seconds < best.eta_seconds:
+                
+            # Factor in queue density at the destination to achieve true Game Theory load balancing
+            from graph.layout import SERVICE_TIMES_MIN
+            base_service_time_seconds = SERVICE_TIMES_MIN.get(dest, 30.0) * 60.0
+            
+            queue_len = graph.node_states[dest].queue_length
+            queue_wait_penalty = queue_len * (base_service_time_seconds / 5.0) # Generalized wait penalty
+            
+            total_equilibrium_cost = result.eta_seconds + queue_wait_penalty
+            
+            if best is None or total_equilibrium_cost < best_cost: 
                 best = result
-            if preferred_dest and dest == preferred_dest and result is not None:
-                # Accept preferred destination unless it's clearly worse
-                if best.path[-1] == preferred_dest:
-                    break
+                best_cost = total_equilibrium_cost
 
         if best is None:
             # Fallback: just stay put (should never happen in a connected graph)
